@@ -26,6 +26,81 @@ def _configure_logging() -> None:
     )
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "rate limit" in text or "429" in text or "too many requests" in text
+
+
+def _build_fallback_summary(filtered_news: list[dict[str, Any]]) -> dict[str, Any]:
+    top_items = filtered_news[:5]
+    top_stories = []
+    key_points = []
+    for item in top_items:
+        title = str(item.get("title", "")).strip()
+        snippet = str(item.get("snippet", "")).strip()
+        source = str(item.get("source", "")).strip()
+        if title:
+            top_stories.append(
+                {
+                    "title": title,
+                    "source": source or "Unknown source",
+                    "why_it_matters": snippet[:220] if snippet else "Emerging update in the AI ecosystem.",
+                }
+            )
+            key_points.append(f"{title} ({source or 'Unknown source'})")
+
+    executive_summary = (
+        f"Compiled {len(filtered_news)} AI-related articles. "
+        "This fallback summary was generated without LLM due to temporary API rate limits."
+    )
+    return {
+        "executive_summary": executive_summary,
+        "key_points": key_points[:5],
+        "top_stories": top_stories,
+    }
+
+
+def _build_fallback_blog(summary_data: dict[str, Any], filtered_news: list[dict[str, Any]]) -> str:
+    lines = [
+        "# Daily AI News Brief",
+        "",
+        "## Executive Summary",
+        str(summary_data.get("executive_summary", "AI news highlights for today.")),
+        "",
+        "## Key Developments",
+    ]
+    key_points = summary_data.get("key_points", [])
+    if key_points:
+        for point in key_points[:8]:
+            lines.append(f"- {point}")
+    else:
+        lines.append("- Key points unavailable in fallback mode.")
+
+    lines.extend(["", "## Top Articles"])
+    for item in filtered_news[:10]:
+        title = str(item.get("title", "")).strip() or "Untitled article"
+        source = str(item.get("source", "")).strip() or "Unknown source"
+        snippet = str(item.get("snippet", "")).strip()
+        link = str(item.get("link", "")).strip()
+        lines.append(f"### {title}")
+        lines.append(f"Source: {source}")
+        if snippet:
+            lines.append("")
+            lines.append(snippet[:350])
+        if link:
+            lines.append("")
+            lines.append(f"[Read more]({link})")
+        lines.append("")
+
+    lines.extend(
+        [
+            "## Notes",
+            "This edition used fallback generation because the LLM provider returned rate-limit responses.",
+        ]
+    )
+    return "\n".join(lines).strip() + "\n"
+
+
 def run_pipeline(settings: Settings | None = None, email_to_override: str | None = None) -> dict[str, Any]:
     """Execute one end-to-end pipeline run."""
     _configure_logging()
@@ -45,8 +120,32 @@ def run_pipeline(settings: Settings | None = None, email_to_override: str | None
     analytics = analyze_news(filtered_news)
 
     llm = GroqLLMService(cfg)
-    summary_data = llm.summarize_news(filtered_news)
-    blog_markdown = llm.generate_blog(summary_data, filtered_news)
+    used_llm_fallback = False
+    llm_rate_limited = False
+    try:
+        summary_data = llm.summarize_news(filtered_news)
+    except Exception as exc:
+        if not _is_rate_limit_error(exc):
+            raise
+        LOGGER.warning("LLM summary rate-limited. Switching to deterministic fallback summary.")
+        used_llm_fallback = True
+        llm_rate_limited = True
+        summary_data = _build_fallback_summary(filtered_news)
+
+    if llm_rate_limited:
+        LOGGER.warning("Skipping LLM blog generation because rate limit was already detected in this run.")
+        used_llm_fallback = True
+        blog_markdown = _build_fallback_blog(summary_data, filtered_news)
+    else:
+        try:
+            blog_markdown = llm.generate_blog(summary_data, filtered_news)
+        except Exception as exc:
+            if not _is_rate_limit_error(exc):
+                raise
+            LOGGER.warning("LLM blog generation rate-limited. Switching to deterministic fallback blog.")
+            used_llm_fallback = True
+            blog_markdown = _build_fallback_blog(summary_data, filtered_news)
+
     blog_assets = build_blog_assets(blog_markdown, filtered_news)
 
     email_html = format_email_html(
@@ -82,6 +181,7 @@ def run_pipeline(settings: Settings | None = None, email_to_override: str | None
         },
         "summary": summary_data,
         "blog_title": blog_assets["title"],
+        "used_llm_fallback": used_llm_fallback,
         "outputs": {
             "markdown_output": str((output_dir / "latest_blog.md").resolve()),
             "html_output": str((output_dir / "latest_blog.html").resolve()),

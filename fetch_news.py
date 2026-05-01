@@ -71,6 +71,8 @@ def fetch_latest_news(settings: Settings) -> list[dict[str, Any]]:
     seen_links: set[str] = set()
 
     for item in raw_items:
+        if len(normalized) >= result_count:
+            break
         article = _normalize_article(item, query_timestamp)
         link = article["link"]
         if not article["title"] or not link:
@@ -82,6 +84,8 @@ def fetch_latest_news(settings: Settings) -> list[dict[str, Any]]:
 
         # Include story variants if present.
         for story in item.get("stories", []) or []:
+            if len(normalized) >= result_count:
+                break
             story_article = _normalize_article(story, query_timestamp)
             story_link = story_article["link"]
             if not story_article["title"] or not story_link or story_link in seen_links:

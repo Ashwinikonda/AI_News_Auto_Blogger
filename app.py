@@ -53,13 +53,29 @@ def main() -> None:
         try:
             result = run_pipeline(email_to_override=email_to_input or None)
         except Exception as exc:
-            st.error(f"Pipeline failed: {exc}")
-            st.exception(exc)
+            message = str(exc)
+            if "rate limit" in message.lower() or "429" in message:
+                st.error(
+                    "Pipeline failed due to Groq API rate limits. "
+                    "Please wait a minute and try again."
+                )
+                st.info(
+                    "Tip: On free tiers, rapid consecutive runs can trigger 429 responses. "
+                    "Retries are now automatic, but hard limits may still require waiting."
+                )
+            else:
+                st.error(f"Pipeline failed: {exc}")
+                st.exception(exc)
             return
 
     analytics = result.get("analytics", {})
     articles = result.get("articles", [])
     st.success(f"Pipeline completed. Email sent to: {result.get('email_sent_to', 'N/A')}")
+    if result.get("used_llm_fallback"):
+        st.warning(
+            "Groq API limits were hit during this run. "
+            "A deterministic fallback summary/blog was used so delivery could continue."
+        )
 
     col1, col2 = st.columns(2)
     with col1:

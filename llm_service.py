@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,8 @@ LOGGER = logging.getLogger(__name__)
 
 SUMMARIZATION_PROMPT_KEY = "[NEWS_SUMMARIZATION_PROMPT]"
 BLOG_PROMPT_KEY = "[BLOG_GENERATION_PROMPT]"
+MAX_RETRIES = 2
+MAX_BACKOFF_SECONDS = 10
 
 
 def _read_prompts_file(prompts_path: Path) -> tuple[str, str]:
@@ -56,8 +59,51 @@ class GroqLLMService:
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        response = requests.post(url, headers=headers, json=payload, timeout=self.settings.request_timeout_seconds)
-        response.raise_for_status()
+        response = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.settings.request_timeout_seconds,
+                )
+                if response.status_code == 429:
+                    wait_seconds = self._resolve_retry_wait(response, attempt)
+                    if attempt >= MAX_RETRIES:
+                        break
+                    LOGGER.warning(
+                        "GROQ API rate limited (attempt %s/%s). Retrying in %s seconds.",
+                        attempt,
+                        MAX_RETRIES,
+                        wait_seconds,
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                response.raise_for_status()
+                break
+            except requests.Timeout:
+                if attempt >= MAX_RETRIES:
+                    raise
+                wait_seconds = min(2 ** (attempt - 1), MAX_BACKOFF_SECONDS)
+                LOGGER.warning(
+                    "GROQ API timeout (attempt %s/%s). Retrying in %s seconds.",
+                    attempt,
+                    MAX_RETRIES,
+                    wait_seconds,
+                )
+                time.sleep(wait_seconds)
+            except requests.RequestException:
+                raise
+
+        if response is None:
+            raise RuntimeError("Unable to complete GROQ request due to repeated transient failures.")
+        if response.status_code == 429:
+            raise RuntimeError(
+                "Groq API rate limit reached. Please wait 1-2 minutes and try again, "
+                "or upgrade your Groq plan limits."
+            )
+
         data = response.json()
         choices = data.get("choices", [])
         if not choices:
@@ -68,7 +114,14 @@ class GroqLLMService:
         return content
 
     @staticmethod
-    def _compact_news_payload(news_items: list[dict[str, Any]], limit: int = 12) -> list[dict[str, str]]:
+    def _resolve_retry_wait(response: requests.Response, attempt: int) -> int:
+        retry_after = response.headers.get("Retry-After", "").strip()
+        if retry_after.isdigit():
+            return max(1, min(int(retry_after), MAX_BACKOFF_SECONDS))
+        return min(2 ** (attempt - 1), MAX_BACKOFF_SECONDS)
+
+    @staticmethod
+    def _compact_news_payload(news_items: list[dict[str, Any]], limit: int = 8) -> list[dict[str, str]]:
         compact = []
         for item in news_items[:limit]:
             compact.append(
@@ -94,7 +147,7 @@ class GroqLLMService:
             system_prompt=self.summary_prompt,
             user_prompt=user_prompt,
             temperature=0.1,
-            max_tokens=1200,
+            max_tokens=700,
         )
         try:
             return json.loads(raw_output)
@@ -115,5 +168,5 @@ class GroqLLMService:
             system_prompt=self.blog_prompt,
             user_prompt=user_prompt,
             temperature=0.35,
-            max_tokens=2200,
+            max_tokens=1200,
         )
